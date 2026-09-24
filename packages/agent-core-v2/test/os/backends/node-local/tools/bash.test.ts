@@ -1,6 +1,9 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { PassThrough, Readable, type Writable } from 'node:stream';
 
-import { describe, expect, it, vi } from 'vitest';
+import { join } from 'pathe';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   IAgentTaskService,
@@ -22,6 +25,7 @@ import { stubWorkspaceContext } from '../../../../session/workspaceContext/stub-
 import type { IAgentToolPolicyService } from '#/agent/toolPolicy/toolPolicy';
 import { type ISessionContext, makeSessionContext } from '#/session/sessionContext/sessionContext';
 import type { IHostProcess, IHostProcessService } from '#/os/interface/hostProcess';
+import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
 import { type BashInput, BashInputSchema } from '#/agent/tools/os/bash/bash';
 import { BashTool } from '#/agent/tools/os/bash/bashTool';
 import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '#/tool/toolContract';
@@ -1895,5 +1899,84 @@ describe('BashTool prompt / runtime consistency', () => {
       expect(promptToolNames).toContain(name);
     }
     expect(errorToolNames.length).toBeGreaterThan(0);
+  });
+});
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && isProcessAlive(pid)) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !isProcessAlive(pid);
+}
+
+async function waitForRecordedPid(path: string, timeoutMs = 5_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number.parseInt((await readFile(path, 'utf8')).trim(), 10);
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    } catch {
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`no pid was recorded at ${path}`);
+}
+
+describe('ProcessTask reap', () => {
+  let dir: string;
+  let spawnedPids: number[];
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'kimi-process-reap-'));
+    spawnedPids = [];
+  });
+
+  afterEach(async () => {
+    for (const pid of spawnedPids.splice(0)) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('reaps a grandchild that outlived the shell which spawned it', async () => {
+    const pidFile = join(dir, 'grandchild.pid');
+    const command = `sleep 300 & echo $! > ${pidFile}`;
+    const proc = await new HostProcessService().spawn('/bin/bash', ['-c', `cd /tmp && ${command}`]);
+    spawnedPids.push(proc.pid);
+
+    const settled: AgentTaskSettlement[] = [];
+    const task = new ProcessTask(proc, command, 'backgrounded grandchild');
+    await task.start({
+      signal: new AbortController().signal,
+      appendOutput: () => {},
+      settle: async (settlement) => {
+        settled.push(settlement);
+        return true;
+      },
+    });
+
+    expect(settled).toEqual([{ status: 'completed' }]);
+    expect(proc.exitCode).toBe(0);
+
+    const grandchild = await waitForRecordedPid(pidFile);
+    expect(isProcessAlive(grandchild)).toBe(true);
+
+    await task.reap();
+
+    expect(await waitForProcessExit(grandchild)).toBe(true);
+    expect(() => process.kill(-proc.pid, 0)).toThrow();
   });
 });

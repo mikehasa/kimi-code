@@ -1,4 +1,5 @@
-import { mkdir, rm } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'pathe';
 
@@ -38,6 +39,36 @@ function persistedProcess(
     status: 'running',
     ...overrides,
   };
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && isProcessAlive(pid)) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !isProcessAlive(pid);
+}
+
+async function waitForRecordedPid(path: string, timeoutMs = 5_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number.parseInt((await readFile(path, 'utf8')).trim(), 10);
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    } catch {
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`no pid was recorded at ${path}`);
 }
 
 beforeEach(async () => {
@@ -124,6 +155,41 @@ describe('AgentTaskService — loadFromDisk + reconcile', () => {
           }),
         }),
       );
+    });
+
+    it('reaps the process group of a task that is marked lost', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'kimi-reap-lost-'));
+      const pidFile = join(dir, 'grandchild.pid');
+      const command = `sleep 300 & echo $! > ${pidFile}; sleep 300`;
+      const shell = spawn('/bin/bash', ['-c', `cd /tmp && { ${command}; }`], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      shell.on('error', () => {});
+      const pid = shell.pid as number;
+      try {
+        const grandchild = await waitForRecordedPid(pidFile);
+        await persistence.writeTask(
+          persistedProcess({
+            taskId: 'bash-orphan00',
+            command,
+            description: 'orphaned shell',
+            pid,
+          }),
+        );
+
+        await background.loadFromDisk();
+        await background.reconcile();
+
+        expect(await waitForProcessExit(grandchild)).toBe(true);
+        expect(await waitForProcessExit(pid)).toBe(true);
+      } finally {
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+        }
+        await rm(dir, { recursive: true, force: true });
+      }
     });
 
     it('runtime restore reconciles persisted tasks through the task resume hook', async () => {

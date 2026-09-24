@@ -33,6 +33,7 @@ export type ProcessTaskOutputCallback = (
 ) => void;
 
 const STREAM_DRAIN_GRACE_MS = 250;
+const REAP_GRACE_MS = 1_000;
 
 export class ProcessTask implements AgentTask {
   readonly kind = 'process' as const;
@@ -93,6 +94,22 @@ export class ProcessTask implements AgentTask {
       }
     } finally {
       await this.disposeProcess();
+    }
+  }
+
+  async reap(): Promise<void> {
+    if (this.proc.pid <= 0) return;
+    await this.signalGroup('SIGTERM');
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, REAP_GRACE_MS);
+    });
+    await this.signalGroup('SIGKILL');
+  }
+
+  private async signalGroup(signal: NodeJS.Signals): Promise<void> {
+    try {
+      await this.proc.kill(signal);
+    } catch {
     }
   }
 

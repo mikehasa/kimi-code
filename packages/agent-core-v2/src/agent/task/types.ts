@@ -54,6 +54,7 @@ export interface AgentTask {
   start(sink: AgentTaskSink): void | Promise<void>;
   onDetach?(): void;
   forceStop?(): Promise<void>;
+  reap?(): Promise<void>;
   toInfo(base: AgentTaskInfoBase): AgentTaskInfo;
 }
 

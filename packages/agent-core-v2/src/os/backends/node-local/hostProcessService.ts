@@ -15,6 +15,8 @@ import {
 
 const isWindows: boolean = process.platform === 'win32';
 const TASKKILL_TIMEOUT_MS = 5_000;
+const PS_TIMEOUT_MS = 5_000;
+const REAP_GRACE_MS = 1_000;
 
 function buildSpawnOptions(options: HostProcessOptions): SpawnOptions {
   const detached = options.detached ?? !isWindows;
@@ -53,6 +55,127 @@ function waitForSpawn(child: ChildProcess): Promise<void> {
     child.once('spawn', onSpawn);
     child.once('error', onError);
   });
+}
+
+async function runTaskkill(pid: number): Promise<void> {
+  const killer = spawn('taskkill', ['/T', '/F', '/PID', String(pid)], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const exited = await Promise.race([
+    new Promise<true>((resolve) => {
+      const done = (): void => {
+        resolve(true);
+      };
+      killer.once('error', done);
+      killer.once('close', done);
+    }),
+    new Promise<false>((resolve) => {
+      timeout = setTimeout(() => {
+        resolve(false);
+      }, TASKKILL_TIMEOUT_MS);
+      timeout.unref?.();
+    }),
+  ]);
+  clearTimeout(timeout);
+  if (!exited) {
+    killer.unref();
+    killer.kill();
+  }
+}
+
+async function runCapture(command: string, args: readonly string[]): Promise<string | undefined> {
+  const child = spawn(command, args as string[], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+    windowsHide: true,
+  });
+  const chunks: Buffer[] = [];
+  child.stdout?.on('data', (chunk: Buffer) => {
+    chunks.push(chunk);
+  });
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const closed = await Promise.race([
+    new Promise<boolean>((resolve) => {
+      child.once('close', () => {
+        resolve(true);
+      });
+      child.once('error', () => {
+        resolve(false);
+      });
+    }),
+    new Promise<boolean>((resolve) => {
+      timeout = setTimeout(() => {
+        resolve(false);
+      }, PS_TIMEOUT_MS);
+      timeout.unref?.();
+    }),
+  ]);
+  clearTimeout(timeout);
+  if (!closed) {
+    child.unref();
+    child.kill();
+    return undefined;
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function readProcessField(field: 'pgid' | 'command', pid: number): Promise<string | undefined> {
+  const output = await runCapture('ps', ['-ww', '-o', `${field}=`, '-p', String(pid)]);
+  return output?.trim();
+}
+
+function normalizeCommandLine(text: string): string {
+  return text.replaceAll(/\\[0-7]{3}/g, ' ').replaceAll(/\s+/g, ' ').trim();
+}
+
+function matchesProcessCommand(observed: string, expected: string): boolean {
+  const wanted = normalizeCommandLine(expected);
+  if (wanted.length === 0) return false;
+  return normalizeCommandLine(observed).includes(wanted);
+}
+
+async function signalProcessGroup(pid: number, signal: NodeJS.Signals): Promise<void> {
+  try {
+    process.kill(-pid, signal);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'ESRCH' || err.code === 'EPERM') return;
+    throw error;
+  }
+}
+
+export type ProcessGroupReapResult =
+  | 'reaped'
+  | 'invalid-pid'
+  | 'not-group-leader'
+  | 'command-mismatch'
+  | 'signal-failed';
+
+export async function reapProcessGroup(
+  pid: number,
+  command: string,
+): Promise<ProcessGroupReapResult> {
+  if (!Number.isInteger(pid) || pid <= 0) return 'invalid-pid';
+  if (isWindows) {
+    await runTaskkill(pid);
+    return 'reaped';
+  }
+  try {
+    if ((await readProcessField('pgid', pid)) !== String(pid)) return 'not-group-leader';
+    const observed = await readProcessField('command', pid);
+    if (observed === undefined || !matchesProcessCommand(observed, command)) {
+      return 'command-mismatch';
+    }
+    await signalProcessGroup(pid, 'SIGTERM');
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, REAP_GRACE_MS);
+    });
+    await signalProcessGroup(pid, 'SIGKILL');
+    return 'reaped';
+  } catch {
+    return 'signal-failed';
+  }
 }
 
 class HostProcess implements IHostProcess {
@@ -115,32 +238,7 @@ class HostProcess implements IHostProcess {
     }
 
     if (isWindows) {
-      const taskkillArgs = ['/T', '/F', '/PID', String(this.pid)];
-      const killer = spawn('taskkill', taskkillArgs, {
-        stdio: 'ignore',
-        windowsHide: true,
-      });
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      const exited = await Promise.race([
-        new Promise<true>((resolve) => {
-          const done = (): void => {
-            resolve(true);
-          };
-          killer.once('error', done);
-          killer.once('close', done);
-        }),
-        new Promise<false>((resolve) => {
-          timeout = setTimeout(() => {
-            resolve(false);
-          }, TASKKILL_TIMEOUT_MS);
-          timeout.unref?.();
-        }),
-      ]);
-      clearTimeout(timeout);
-      if (!exited) {
-        killer.unref();
-        killer.kill();
-      }
+      await runTaskkill(this.pid);
       return;
     }
 

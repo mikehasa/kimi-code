@@ -669,6 +669,55 @@ describe('AgentTaskService', () => {
     expect(forceStop).not.toHaveBeenCalled();
   });
 
+  it('dispose reaps a completed process task whose process group outlived its shell', async () => {
+    const svc = ix.get(IAgentTaskService);
+    const reap = vi.fn(async () => {});
+    const taskId = svc.registerTask({
+      ...fakeProcessTask(),
+      reap,
+      start: async (sink) => {
+        await sink.settle({ status: 'completed' });
+      },
+    });
+    await waitForCondition(() => svc.getTask(taskId)?.status === 'completed');
+
+    disposables.dispose();
+    await Promise.resolve();
+
+    expect(reap).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispose does not reap a completed process task when keepAliveOnExit is set', async () => {
+    stubTaskConfig({ keepAliveOnExit: true });
+    const svc = ix.get(IAgentTaskService);
+    const reap = vi.fn(async () => {});
+    const taskId = svc.registerTask({
+      ...fakeProcessTask(),
+      reap,
+      start: async (sink) => {
+        await sink.settle({ status: 'completed' });
+      },
+    });
+    await waitForCondition(() => svc.getTask(taskId)?.status === 'completed');
+
+    disposables.dispose();
+    await Promise.resolve();
+
+    expect(reap).not.toHaveBeenCalled();
+  });
+
+  it('dispose does not reap a process task that never settled', async () => {
+    const svc = ix.get(IAgentTaskService);
+    const reap = vi.fn(async () => {});
+    svc.registerTask({ ...fakeProcessTask(), reap });
+    await Promise.resolve();
+
+    disposables.dispose();
+    await Promise.resolve();
+
+    expect(reap).not.toHaveBeenCalled();
+  });
+
   it('scope disposal leaves a process running when keepAliveOnExit is set, and its late settle stays silent after deactivation', async () => {
     const { records } = capturingWire();
     const track2 = vi.fn();

@@ -43,6 +43,7 @@ import { IConfigService } from '#/app/config/config';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
 import { IFileSystemStorageService } from '#/persistence/interface/storage';
+import { reapProcessGroup } from '#/os/backends/node-local/hostProcessService';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import {
   IAgentTaskService,
@@ -543,9 +544,29 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
     for (const info of lostTasks) {
       this.recordTaskTerminated(info);
     }
+    await this.reapLostProcessGroups(lostTasks);
     this.appendPreviousSessionTasksReminder();
     await this.restoreAgentTaskNotifications();
     return lostTasks;
+  }
+
+  private async reapLostProcessGroups(lostTasks: readonly AgentTaskInfo[]): Promise<void> {
+    for (const info of lostTasks) {
+      if (info.kind !== 'process') continue;
+      const result = await reapProcessGroup(info.pid, info.command);
+      if (result === 'reaped') {
+        this.log.info('reaped the process group of a lost task', {
+          taskId: info.taskId,
+          pid: info.pid,
+        });
+        continue;
+      }
+      this.log.debug('skipped reaping the process group of a lost task', {
+        taskId: info.taskId,
+        pid: info.pid,
+        reason: result,
+      });
+    }
   }
 
   async getOutputSnapshot(
@@ -797,7 +818,10 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
   override dispose(): void {
     if (!this.keepAliveOnExit()) {
       for (const entry of this.tasks.values()) {
-        if (TERMINAL_STATUSES.has(entry.status)) continue;
+        if (TERMINAL_STATUSES.has(entry.status)) {
+          this.reapOnDispose(entry);
+          continue;
+        }
         if (entry.timeoutHandle !== undefined) {
           clearTimeout(entry.timeoutHandle);
           entry.timeoutHandle = undefined;
@@ -811,6 +835,14 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
       }
     }
     super.dispose();
+  }
+
+  private reapOnDispose(entry: ManagedTask): void {
+    const reap = entry.task?.reap?.bind(entry.task);
+    if (reap === undefined) return;
+    try {
+      void reap().catch(() => {});
+    } catch {}
   }
 
   private forceStopOnDispose(entry: ManagedTask): void {
